@@ -1,0 +1,24 @@
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+
+.ipynb_checkpoints/
+.DS_Store
+
+# Local experiment outputs.
+res/
+results/
+runs/
+experiments/results/
+
+# Local datasets and generated client splits.
+*.npy
+*.pkl
+*.npz
+*.idx*-ubyte
+*.gz
+
+# Large/raw external resources should live outside the source repository.
+PFA-res/
+PFA_res/

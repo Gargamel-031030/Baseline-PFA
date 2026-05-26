@@ -13,6 +13,7 @@ runs/
 experiments/results/
 
 # Local datasets and generated client splits.
+data/
 *.npy
 *.pkl
 *.npz

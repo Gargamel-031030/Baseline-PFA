@@ -8,18 +8,21 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
 import random
-from collections import OrderedDict
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from collections import Counter, OrderedDict
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, models, transforms
 
 
+CIFAR100_NUM_CLASSES = 100
 CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
 CIFAR100_STD = (0.2675, 0.2565, 0.2761)
 
@@ -41,6 +44,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", default="./data")
     parser.add_argument("--num_clients", type=int, default=10)
     parser.add_argument("--client_fraction", type=float, default=1.0)
+    parser.add_argument(
+        "--partition",
+        default="iid",
+        choices=["iid", "non-iid", "dirichlet"],
+        help="Client data partition strategy.",
+    )
+    parser.add_argument(
+        "--dirichlet_alpha",
+        type=float,
+        default=0.5,
+        help="Dirichlet concentration parameter used for non-iid/dirichlet partitioning.",
+    )
     parser.add_argument("--global_rounds", type=int, default=20)
     parser.add_argument("--local_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -56,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         "--limit_train_samples",
         type=int,
         default=None,
-        help="Optional smoke-test limit before IID partitioning.",
+        help="Optional smoke-test limit before partitioning.",
     )
     parser.add_argument(
         "--limit_test_samples",
@@ -69,11 +84,22 @@ def parse_args() -> argparse.Namespace:
         default="results/baseline_fedavg_cifar100_resnet18.csv",
         help="Where to save per-round train loss and test accuracy.",
     )
+    parser.add_argument(
+        "--client_distribution_csv",
+        default=None,
+        help="Optional path for saving per-client CIFAR-100 label counts as CSV.",
+    )
+    parser.add_argument(
+        "--client_distribution_json",
+        default=None,
+        help="Optional path for saving per-client CIFAR-100 label counts as JSON.",
+    )
     return parser.parse_args()
 
 
 def set_random_seed(seed: int) -> None:
     random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -106,7 +132,7 @@ def build_cifar100_transforms() -> Tuple[transforms.Compose, transforms.Compose]
     return train_transform, test_transform
 
 
-def build_resnet18_cifar100(num_classes: int = 100) -> nn.Module:
+def build_resnet18_cifar100(num_classes: int = CIFAR100_NUM_CLASSES) -> nn.Module:
     try:
         model = models.resnet18(weights=None)
     except TypeError:
@@ -171,6 +197,167 @@ def iid_partition(dataset: Dataset, num_clients: int, seed: int) -> List[Subset]
         partitions.append(Subset(dataset, client_indices))
         cursor += client_size
     return partitions
+
+
+def get_dataset_targets(dataset: Dataset) -> List[int]:
+    if isinstance(dataset, Subset):
+        parent_targets = get_dataset_targets(dataset.dataset)
+        return [int(parent_targets[int(index)]) for index in dataset.indices]
+    if hasattr(dataset, "targets"):
+        return [int(target) for target in dataset.targets]
+    if hasattr(dataset, "labels"):
+        return [int(target) for target in dataset.labels]
+    return [int(dataset[index][1]) for index in range(len(dataset))]
+
+
+def ensure_min_client_samples(
+    client_indices: List[List[int]],
+    min_samples_per_client: int,
+    rng: np.random.Generator,
+) -> None:
+    for client_id in range(len(client_indices)):
+        while len(client_indices[client_id]) < min_samples_per_client:
+            donor_id = max(range(len(client_indices)), key=lambda idx: len(client_indices[idx]))
+            if len(client_indices[donor_id]) <= min_samples_per_client:
+                raise RuntimeError(
+                    "Unable to rebalance non-iid partition without creating an empty client."
+                )
+            donor_position = int(rng.integers(len(client_indices[donor_id])))
+            client_indices[client_id].append(client_indices[donor_id].pop(donor_position))
+
+
+def dirichlet_partition(
+    dataset: Dataset,
+    num_clients: int,
+    alpha: float,
+    seed: int,
+    min_samples_per_client: int = 1,
+) -> List[Subset]:
+    if num_clients <= 0:
+        raise ValueError("--num_clients must be positive.")
+    if num_clients > len(dataset):
+        raise ValueError("--num_clients cannot exceed the number of train samples.")
+    if alpha <= 0:
+        raise ValueError("--dirichlet_alpha must be positive.")
+
+    rng = np.random.default_rng(seed)
+    targets = np.asarray(get_dataset_targets(dataset), dtype=np.int64)
+    client_indices: List[List[int]] = [[] for _ in range(num_clients)]
+
+    for class_id in sorted(np.unique(targets).tolist()):
+        class_indices = np.where(targets == class_id)[0]
+        rng.shuffle(class_indices)
+
+        proportions = rng.dirichlet(np.full(num_clients, alpha, dtype=np.float64))
+        split_points = (np.cumsum(proportions)[:-1] * len(class_indices)).astype(int)
+        class_splits = np.split(class_indices, split_points)
+
+        for client_id, split in enumerate(class_splits):
+            client_indices[client_id].extend(int(index) for index in split.tolist())
+
+    ensure_min_client_samples(client_indices, min_samples_per_client, rng)
+    for indices in client_indices:
+        rng.shuffle(indices)
+
+    return [Subset(dataset, indices) for indices in client_indices]
+
+
+def build_client_partitions(
+    dataset: Dataset,
+    num_clients: int,
+    partition: str,
+    dirichlet_alpha: float,
+    seed: int,
+) -> List[Subset]:
+    if partition == "iid":
+        return iid_partition(dataset, num_clients, seed)
+    if partition in {"dirichlet", "non-iid"}:
+        return dirichlet_partition(dataset, num_clients, dirichlet_alpha, seed)
+    raise ValueError(f"Unsupported partition: {partition}")
+
+
+def compute_client_label_distribution(
+    client_datasets: Sequence[Dataset],
+    num_classes: int,
+) -> List[Dict[str, object]]:
+    distribution = []
+    for client_id, dataset in enumerate(client_datasets):
+        targets = get_dataset_targets(dataset)
+        class_counts = Counter(targets)
+        label_counts = {
+            str(class_id): int(class_counts.get(class_id, 0))
+            for class_id in range(num_classes)
+        }
+        distribution.append(
+            {
+                "client_id": client_id,
+                "total_samples": len(targets),
+                "num_classes": sum(1 for count in label_counts.values() if count > 0),
+                "label_counts": label_counts,
+            }
+        )
+    return distribution
+
+
+def log_client_label_distribution(distribution: Sequence[Dict[str, object]]) -> None:
+    print("Client label distribution summary:")
+    for item in distribution:
+        print(
+            f"  client {int(item['client_id']):02d}: "
+            f"samples={int(item['total_samples'])}, "
+            f"classes={int(item['num_classes'])}"
+        )
+
+
+def save_client_label_distribution_csv(
+    path: str,
+    distribution: Sequence[Dict[str, object]],
+    num_classes: int,
+) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", newline="") as csvfile:
+        fieldnames = ["client_id", "total_samples", "num_classes"] + [
+            f"class_{class_id}" for class_id in range(num_classes)
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in distribution:
+            label_counts = item["label_counts"]
+            row = {
+                "client_id": item["client_id"],
+                "total_samples": item["total_samples"],
+                "num_classes": item["num_classes"],
+            }
+            row.update(
+                {
+                    f"class_{class_id}": label_counts[str(class_id)]
+                    for class_id in range(num_classes)
+                }
+            )
+            writer.writerow(row)
+
+
+def save_client_label_distribution_json(
+    path: str,
+    distribution: Sequence[Dict[str, object]],
+    partition: str,
+    dirichlet_alpha: float,
+    num_classes: int,
+) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    payload = {
+        "partition": partition,
+        "dirichlet_alpha": dirichlet_alpha,
+        "num_clients": len(distribution),
+        "num_classes": num_classes,
+        "clients": distribution,
+    }
+    with open(path, "w") as jsonfile:
+        json.dump(payload, jsonfile, indent=2)
 
 
 def make_train_loaders(
@@ -377,7 +564,31 @@ def main() -> None:
         limit_train=args.limit_train_samples,
         limit_test=args.limit_test_samples,
     )
-    client_datasets = iid_partition(train_dataset, args.num_clients, args.seed)
+    client_datasets = build_client_partitions(
+        train_dataset,
+        num_clients=args.num_clients,
+        partition=args.partition,
+        dirichlet_alpha=args.dirichlet_alpha,
+        seed=args.seed,
+    )
+    client_label_distribution = compute_client_label_distribution(
+        client_datasets,
+        num_classes=CIFAR100_NUM_CLASSES,
+    )
+    if args.client_distribution_csv:
+        save_client_label_distribution_csv(
+            args.client_distribution_csv,
+            client_label_distribution,
+            num_classes=CIFAR100_NUM_CLASSES,
+        )
+    if args.client_distribution_json:
+        save_client_label_distribution_json(
+            args.client_distribution_json,
+            client_label_distribution,
+            partition=args.partition,
+            dirichlet_alpha=args.dirichlet_alpha,
+            num_classes=CIFAR100_NUM_CLASSES,
+        )
     train_loaders = make_train_loaders(
         client_datasets,
         batch_size=args.batch_size,
@@ -398,6 +609,13 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Train samples: {len(train_dataset)}, test samples: {len(test_dataset)}")
     print(f"Clients: {args.num_clients}, client_fraction: {args.client_fraction}")
+    print(f"Partition: {args.partition}")
+    print(f"Dirichlet alpha: {args.dirichlet_alpha}")
+    log_client_label_distribution(client_label_distribution)
+    if args.client_distribution_csv:
+        print(f"Client distribution CSV saved to: {args.client_distribution_csv}")
+    if args.client_distribution_json:
+        print(f"Client distribution JSON saved to: {args.client_distribution_json}")
     print("DP, clipping, noise, epsilon, delta, and accountants are disabled.")
 
     final_test_acc = 0.0

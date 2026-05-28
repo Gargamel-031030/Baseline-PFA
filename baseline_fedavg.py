@@ -1,7 +1,9 @@
-"""Pure FedAvg baseline for CIFAR-100 with a CIFAR-style ResNet18.
+"""Privacy-free FedAvg baseline for CIFAR-100 with ResNet18.
 
 This entry point intentionally bypasses all DP/PFA/privacy-accountant code.
-It is meant to provide a simple no-DP baseline for later comparisons.
+It follows the paper-style PF baseline setup after replacing CIFAR-10 with
+CIFAR-100: ResNet18, Dirichlet non-IID partitioning, client sampling, and
+vanilla FedAvg aggregation.
 """
 
 from __future__ import annotations
@@ -26,10 +28,17 @@ CIFAR100_NUM_CLASSES = 100
 CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
 CIFAR100_STD = (0.2675, 0.2565, 0.2761)
 
+PAPER_DEFAULT_NUM_CLIENTS = 20
+PAPER_DEFAULT_CLIENT_FRACTION = 0.8
+PAPER_DEFAULT_DIRICHLET_ALPHA = 0.3
+PAPER_DEFAULT_GLOBAL_ROUNDS = 100
+PAPER_DEFAULT_LOCAL_EPOCHS = 1
+PAPER_DEFAULT_BATCH_SIZE = 16
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="CIFAR-100 + ResNet18 + no-DP FedAvg baseline."
+        description="CIFAR-100 + ResNet18 + privacy-free FedAvg baseline."
     )
     parser.add_argument("--dataset", default="cifar100", choices=["cifar100"])
     parser.add_argument("--model", default="resnet18", choices=["resnet18"])
@@ -42,28 +51,70 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--data_dir", default="./data")
-    parser.add_argument("--num_clients", type=int, default=10)
-    parser.add_argument("--client_fraction", type=float, default=1.0)
+    parser.add_argument(
+        "--num_clients",
+        type=int,
+        default=PAPER_DEFAULT_NUM_CLIENTS,
+        help=(
+            "Total FL clients. Paper reports K in {20, 30, 40, 50}; "
+            "default is K=20."
+        ),
+    )
+    parser.add_argument(
+        "--client_fraction",
+        type=float,
+        default=PAPER_DEFAULT_CLIENT_FRACTION,
+        help="Client sample rate per round. Paper default is 0.8.",
+    )
     parser.add_argument(
         "--partition",
-        default="iid",
+        default="dirichlet",
         choices=["iid", "non-iid", "dirichlet"],
         help="Client data partition strategy.",
     )
     parser.add_argument(
         "--dirichlet_alpha",
         type=float,
-        default=0.5,
-        help="Dirichlet concentration parameter used for non-iid/dirichlet partitioning.",
+        default=PAPER_DEFAULT_DIRICHLET_ALPHA,
+        help="Dirichlet scaling/concentration parameter. Paper CIFAR10 setting is 0.3.",
     )
-    parser.add_argument("--global_rounds", type=int, default=20)
-    parser.add_argument("--local_epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument(
+        "--global_rounds",
+        type=int,
+        default=PAPER_DEFAULT_GLOBAL_ROUNDS,
+        help="Global communication rounds. Paper default is T=100.",
+    )
+    parser.add_argument(
+        "--local_epochs",
+        type=int,
+        default=PAPER_DEFAULT_LOCAL_EPOCHS,
+        help=(
+            "Number of full local epochs when --local_update_mode=full-epoch. "
+            "In random-batch mode, each selected client always updates on one "
+            "random mini-batch per communication round."
+        ),
+    )
+    parser.add_argument(
+        "--local_update_mode",
+        default="random-batch",
+        choices=["random-batch", "full-epoch"],
+        help=(
+            "random-batch matches the paper-style local update: one shuffled "
+            "mini-batch per selected client per communication round. "
+            "full-epoch preserves the old behavior."
+        ),
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=PAPER_DEFAULT_BATCH_SIZE,
+        help="Local random batch size. Paper default is B=16.",
+    )
     parser.add_argument("--test_batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight_decay", type=float, default=5e-4)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--eval_every", type=int, default=1)
@@ -81,13 +132,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output_csv",
-        default="results/baseline_fedavg_cifar100_resnet18.csv",
+        default="results/pf_fedavg_cifar100_resnet18_noniid_alpha0.3.csv",
         help="Where to save per-round train loss and test accuracy.",
+    )
+    parser.add_argument(
+        "--run_config_json",
+        default=None,
+        help="Optional path for saving run configuration as JSON.",
+    )
+    parser.add_argument(
+        "--run_config_csv",
+        default=None,
+        help="Where to save run configuration and final summary as CSV.",
     )
     parser.add_argument(
         "--client_distribution_csv",
         default=None,
-        help="Optional path for saving per-client CIFAR-100 label counts as CSV.",
+        help="Where to save per-client CIFAR-100 label counts as CSV.",
     )
     parser.add_argument(
         "--client_distribution_json",
@@ -360,6 +421,121 @@ def save_client_label_distribution_json(
         json.dump(payload, jsonfile, indent=2)
 
 
+def resolve_run_config_csv_path(output_csv: str, run_config_csv: Optional[str]) -> str:
+    if run_config_csv:
+        return run_config_csv
+    base_path, _ = os.path.splitext(output_csv)
+    return f"{base_path}_config.csv"
+
+
+def resolve_client_distribution_csv_path(
+    output_csv: str,
+    client_distribution_csv: Optional[str],
+) -> str:
+    if client_distribution_csv:
+        return client_distribution_csv
+    base_path, _ = os.path.splitext(output_csv)
+    return f"{base_path}_client_distribution.csv"
+
+
+def save_run_config_json(
+    path: str,
+    args: argparse.Namespace,
+    client_distribution: Sequence[Dict[str, object]],
+) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    payload = {
+        "baseline": "PF / PrivacyFree / vanilla FedAvg without DP",
+        "paper_migration": {
+            "source_pdf": "TNSE.pdf",
+            "source_dataset": "CIFAR10",
+            "target_dataset": "CIFAR100",
+            "model": "ResNet18",
+            "partition": "Dirichlet non-IID",
+            "paper_dirichlet_alpha": PAPER_DEFAULT_DIRICHLET_ALPHA,
+            "paper_client_fraction": PAPER_DEFAULT_CLIENT_FRACTION,
+            "paper_global_rounds": PAPER_DEFAULT_GLOBAL_ROUNDS,
+            "paper_batch_size": PAPER_DEFAULT_BATCH_SIZE,
+            "paper_style_local_update": "one random mini-batch per selected client per round",
+            "dp_enabled": False,
+        },
+        "args": vars(args),
+        "effective_local_updates_per_round": (
+            1 if args.local_update_mode == "random-batch" else args.local_epochs
+        ),
+        "client_summary": [
+            {
+                "client_id": item["client_id"],
+                "total_samples": item["total_samples"],
+                "num_classes": item["num_classes"],
+            }
+            for item in client_distribution
+        ],
+    }
+    with open(path, "w") as jsonfile:
+        json.dump(payload, jsonfile, indent=2)
+
+
+def save_run_config_csv(
+    path: str,
+    args: argparse.Namespace,
+    client_distribution: Sequence[Dict[str, object]],
+    final_test_accuracy: Optional[float] = None,
+) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    total_samples = sum(int(item["total_samples"]) for item in client_distribution)
+    min_client_samples = min(int(item["total_samples"]) for item in client_distribution)
+    max_client_samples = max(int(item["total_samples"]) for item in client_distribution)
+    min_client_classes = min(int(item["num_classes"]) for item in client_distribution)
+    max_client_classes = max(int(item["num_classes"]) for item in client_distribution)
+
+    rows = [
+        ("baseline", "name", "PF / PrivacyFree / vanilla FedAvg without DP"),
+        ("paper_migration", "source_pdf", "TNSE.pdf"),
+        ("paper_migration", "source_dataset", "CIFAR10"),
+        ("paper_migration", "target_dataset", "CIFAR100"),
+        ("paper_migration", "model", "ResNet18"),
+        ("paper_migration", "partition", "Dirichlet non-IID"),
+        ("paper_migration", "paper_dirichlet_alpha", PAPER_DEFAULT_DIRICHLET_ALPHA),
+        ("paper_migration", "paper_client_fraction", PAPER_DEFAULT_CLIENT_FRACTION),
+        ("paper_migration", "paper_global_rounds", PAPER_DEFAULT_GLOBAL_ROUNDS),
+        ("paper_migration", "paper_batch_size", PAPER_DEFAULT_BATCH_SIZE),
+        (
+            "paper_migration",
+            "paper_style_local_update",
+            "one random mini-batch per selected client per round",
+        ),
+        ("paper_migration", "dp_enabled", False),
+        ("client_summary", "total_samples", total_samples),
+        ("client_summary", "min_client_samples", min_client_samples),
+        ("client_summary", "max_client_samples", max_client_samples),
+        ("client_summary", "min_client_classes", min_client_classes),
+        ("client_summary", "max_client_classes", max_client_classes),
+    ]
+
+    for key, value in sorted(vars(args).items()):
+        rows.append(("args", key, value))
+
+    effective_local_updates = (
+        1 if args.local_update_mode == "random-batch" else args.local_epochs
+    )
+    rows.append(("effective", "local_updates_per_round", effective_local_updates))
+
+    if final_test_accuracy is not None:
+        rows.append(("result", "final_test_accuracy", f"{final_test_accuracy:.6f}"))
+
+    with open(path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["section", "key", "value"])
+        writer.writerows(rows)
+
+
 def make_train_loaders(
     client_datasets: Sequence[Dataset],
     batch_size: int,
@@ -414,11 +590,33 @@ def clone_state_dict(state_dict: OrderedDict[str, torch.Tensor]) -> OrderedDict[
     return OrderedDict((name, tensor.detach().cpu().clone()) for name, tensor in state_dict.items())
 
 
+def train_minibatch(
+    model: nn.Module,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    device: torch.device,
+) -> Tuple[float, int]:
+    inputs = inputs.to(device, non_blocking=True)
+    targets = targets.to(device, non_blocking=True)
+
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(inputs)
+    loss = criterion(logits, targets)
+    loss.backward()
+    optimizer.step()
+
+    batch_size = targets.size(0)
+    return loss.item() * batch_size, batch_size
+
+
 def train_client(
     model_fn: Callable[[], nn.Module],
     global_state: OrderedDict[str, torch.Tensor],
     train_loader: DataLoader,
     local_epochs: int,
+    local_update_mode: str,
     lr: float,
     momentum: float,
     weight_decay: float,
@@ -438,20 +636,35 @@ def train_client(
 
     total_loss = 0.0
     total_examples = 0
-    for _ in range(local_epochs):
-        for inputs, targets in train_loader:
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(inputs)
-            loss = criterion(logits, targets)
-            loss.backward()
-            optimizer.step()
-
-            batch_size = targets.size(0)
-            total_loss += loss.item() * batch_size
-            total_examples += batch_size
+    if local_update_mode == "random-batch":
+        inputs, targets = next(iter(train_loader))
+        batch_loss, batch_size = train_minibatch(
+            model,
+            criterion,
+            optimizer,
+            inputs,
+            targets,
+            device,
+        )
+        total_loss += batch_loss
+        total_examples += batch_size
+    elif local_update_mode == "full-epoch":
+        if local_epochs <= 0:
+            raise ValueError("--local_epochs must be positive.")
+        for _ in range(local_epochs):
+            for inputs, targets in train_loader:
+                batch_loss, batch_size = train_minibatch(
+                    model,
+                    criterion,
+                    optimizer,
+                    inputs,
+                    targets,
+                    device,
+                )
+                total_loss += batch_loss
+                total_examples += batch_size
+    else:
+        raise ValueError(f"Unsupported local update mode: {local_update_mode}")
 
     avg_loss = total_loss / max(1, total_examples)
     return clone_state_dict(model.state_dict()), avg_loss, len(train_loader.dataset)
@@ -575,12 +788,19 @@ def main() -> None:
         client_datasets,
         num_classes=CIFAR100_NUM_CLASSES,
     )
-    if args.client_distribution_csv:
-        save_client_label_distribution_csv(
-            args.client_distribution_csv,
-            client_label_distribution,
-            num_classes=CIFAR100_NUM_CLASSES,
-        )
+    args.run_config_csv = resolve_run_config_csv_path(
+        args.output_csv,
+        args.run_config_csv,
+    )
+    args.client_distribution_csv = resolve_client_distribution_csv_path(
+        args.output_csv,
+        args.client_distribution_csv,
+    )
+    save_client_label_distribution_csv(
+        args.client_distribution_csv,
+        client_label_distribution,
+        num_classes=CIFAR100_NUM_CLASSES,
+    )
     if args.client_distribution_json:
         save_client_label_distribution_json(
             args.client_distribution_json,
@@ -589,6 +809,17 @@ def main() -> None:
             dirichlet_alpha=args.dirichlet_alpha,
             num_classes=CIFAR100_NUM_CLASSES,
         )
+    if args.run_config_json:
+        save_run_config_json(
+            args.run_config_json,
+            args,
+            client_label_distribution,
+        )
+    save_run_config_csv(
+        args.run_config_csv,
+        args,
+        client_label_distribution,
+    )
     train_loaders = make_train_loaders(
         client_datasets,
         batch_size=args.batch_size,
@@ -605,17 +836,30 @@ def main() -> None:
     global_state = clone_state_dict(global_model.state_dict())
     init_output_csv(args.output_csv)
 
-    print("Baseline: CIFAR-100 + ResNet18 + FedAvg + no-DP")
+    print("Baseline: CIFAR-100 + ResNet18 + PF/FedAvg + no-DP")
     print(f"Device: {device}")
     print(f"Train samples: {len(train_dataset)}, test samples: {len(test_dataset)}")
     print(f"Clients: {args.num_clients}, client_fraction: {args.client_fraction}")
+    print(f"Global rounds: {args.global_rounds}")
+    print(f"Local update mode: {args.local_update_mode}")
+    if args.local_update_mode == "random-batch":
+        print("Local update: one random mini-batch per selected client per round")
+    else:
+        print(f"Local update: {args.local_epochs} full local epochs per selected client")
+    print(f"Batch size: {args.batch_size}, test_batch_size: {args.test_batch_size}")
+    print(
+        f"Learning rate: {args.lr}, momentum: {args.momentum}, "
+        f"weight_decay: {args.weight_decay}"
+    )
     print(f"Partition: {args.partition}")
     print(f"Dirichlet alpha: {args.dirichlet_alpha}")
     log_client_label_distribution(client_label_distribution)
-    if args.client_distribution_csv:
-        print(f"Client distribution CSV saved to: {args.client_distribution_csv}")
+    print(f"Client distribution CSV saved to: {args.client_distribution_csv}")
     if args.client_distribution_json:
         print(f"Client distribution JSON saved to: {args.client_distribution_json}")
+    if args.run_config_json:
+        print(f"Run config JSON saved to: {args.run_config_json}")
+    print(f"Run config CSV saved to: {args.run_config_csv}")
     print("DP, clipping, noise, epsilon, delta, and accountants are disabled.")
 
     final_test_acc = 0.0
@@ -633,6 +877,7 @@ def main() -> None:
                 global_state=global_state,
                 train_loader=train_loaders[client_id],
                 local_epochs=args.local_epochs,
+                local_update_mode=args.local_update_mode,
                 lr=args.lr,
                 momentum=args.momentum,
                 weight_decay=args.weight_decay,
@@ -670,6 +915,13 @@ def main() -> None:
 
     print(f"Final test accuracy: {final_test_acc:.4f}")
     print(f"Metrics saved to: {args.output_csv}")
+    save_run_config_csv(
+        args.run_config_csv,
+        args,
+        client_label_distribution,
+        final_test_accuracy=final_test_acc,
+    )
+    print(f"Run summary CSV saved to: {args.run_config_csv}")
 
 
 if __name__ == "__main__":

@@ -28,12 +28,17 @@ CIFAR100_NUM_CLASSES = 100
 CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
 CIFAR100_STD = (0.2675, 0.2565, 0.2761)
 
-PAPER_DEFAULT_NUM_CLIENTS = 20
-PAPER_DEFAULT_CLIENT_FRACTION = 0.8
-PAPER_DEFAULT_DIRICHLET_ALPHA = 0.3
-PAPER_DEFAULT_GLOBAL_ROUNDS = 100
-PAPER_DEFAULT_LOCAL_STEPS = 3
-PAPER_DEFAULT_BATCH_SIZE = 64
+PAPER_SOURCE_DIRICHLET_ALPHA = 0.3
+CIFAR100_HARD_DIRICHLET_ALPHA = 0.3
+CIFAR100_MAIN_NUM_CLIENTS = 20
+CIFAR100_MAIN_CLIENT_FRACTION = 0.8
+CIFAR100_MAIN_DIRICHLET_ALPHA = 0.5
+CIFAR100_MAIN_GLOBAL_ROUNDS = 300
+CIFAR100_MAIN_LOCAL_STEPS = 20
+CIFAR100_MAIN_BATCH_SIZE = 64
+CIFAR100_MAIN_LR = 0.05
+CIFAR100_MAIN_MOMENTUM = 0.9
+CIFAR100_MAIN_WEIGHT_DECAY = 5e-4
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_clients",
         type=int,
-        default=PAPER_DEFAULT_NUM_CLIENTS,
+        default=CIFAR100_MAIN_NUM_CLIENTS,
         help=(
             "Total FL clients. Paper reports K in {20, 30, 40, 50}; "
             "default is K=20."
@@ -63,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--client_fraction",
         type=float,
-        default=PAPER_DEFAULT_CLIENT_FRACTION,
+        default=CIFAR100_MAIN_CLIENT_FRACTION,
         help="Client sample rate per round. Paper default is 0.8.",
     )
     parser.add_argument(
@@ -75,22 +80,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dirichlet_alpha",
         type=float,
-        default=PAPER_DEFAULT_DIRICHLET_ALPHA,
-        help="Dirichlet scaling/concentration parameter. Paper CIFAR10 setting is 0.3.",
+        default=CIFAR100_MAIN_DIRICHLET_ALPHA,
+        help=(
+            "Dirichlet scaling/concentration parameter. CIFAR-100 main "
+            "baseline default is 0.5; use 0.3 for the harder paper-style "
+            "non-IID setting."
+        ),
     )
     parser.add_argument(
         "--global_rounds",
         type=int,
-        default=PAPER_DEFAULT_GLOBAL_ROUNDS,
-        help="Global communication rounds. Paper default is T=100.",
+        default=CIFAR100_MAIN_GLOBAL_ROUNDS,
+        help="Global communication rounds. CIFAR-100 main baseline default is 300.",
     )
     parser.add_argument(
         "--local_steps",
         type=int,
-        default=PAPER_DEFAULT_LOCAL_STEPS,
+        default=CIFAR100_MAIN_LOCAL_STEPS,
         help=(
             "Number of random mini-batch SGD steps per selected client per "
-            "communication round. Default is 3 for the CIFAR-100 baseline."
+            "communication round. CIFAR-100 main baseline default is 20."
         ),
     )
     parser.add_argument(
@@ -109,19 +118,19 @@ def parse_args() -> argparse.Namespace:
         help=(
             "random-batch performs --local_steps shuffled mini-batch updates "
             "per selected client per communication round. "
-            "full-epoch preserves the old behavior."
+            "full-epoch iterates through the selected client's full DataLoader."
         ),
     )
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=PAPER_DEFAULT_BATCH_SIZE,
+        default=CIFAR100_MAIN_BATCH_SIZE,
         help="Local random batch size. Default is 64 for CIFAR-100 stability.",
     )
     parser.add_argument("--test_batch_size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=0.1)
-    parser.add_argument("--momentum", type=float, default=0.9)
-    parser.add_argument("--weight_decay", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=CIFAR100_MAIN_LR)
+    parser.add_argument("--momentum", type=float, default=CIFAR100_MAIN_MOMENTUM)
+    parser.add_argument("--weight_decay", type=float, default=CIFAR100_MAIN_WEIGHT_DECAY)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--device", default="auto")
@@ -142,7 +151,7 @@ def parse_args() -> argparse.Namespace:
         "--output_csv",
         default=(
             "results/pf_fedavg_cifar100_resnet18_noniid_"
-            "alpha0.3_k20_sr0.8_local3_b64.csv"
+            "alpha0.5_k20_sr0.8_steps20_b64_lr0.05_r300.csv"
         ),
         help="Where to save per-round train loss and test accuracy.",
     )
@@ -466,11 +475,14 @@ def save_run_config_json(
             "target_dataset": "CIFAR100",
             "model": "ResNet18",
             "partition": "Dirichlet non-IID",
-            "paper_dirichlet_alpha": PAPER_DEFAULT_DIRICHLET_ALPHA,
-            "paper_client_fraction": PAPER_DEFAULT_CLIENT_FRACTION,
-            "paper_global_rounds": PAPER_DEFAULT_GLOBAL_ROUNDS,
-            "paper_batch_size": PAPER_DEFAULT_BATCH_SIZE,
-            "local_steps": PAPER_DEFAULT_LOCAL_STEPS,
+            "paper_cifar10_dirichlet_alpha": PAPER_SOURCE_DIRICHLET_ALPHA,
+            "cifar100_main_dirichlet_alpha": CIFAR100_MAIN_DIRICHLET_ALPHA,
+            "cifar100_hard_dirichlet_alpha": CIFAR100_HARD_DIRICHLET_ALPHA,
+            "cifar100_main_client_fraction": CIFAR100_MAIN_CLIENT_FRACTION,
+            "cifar100_main_global_rounds": CIFAR100_MAIN_GLOBAL_ROUNDS,
+            "cifar100_main_batch_size": CIFAR100_MAIN_BATCH_SIZE,
+            "cifar100_main_local_steps": CIFAR100_MAIN_LOCAL_STEPS,
+            "cifar100_main_lr": CIFAR100_MAIN_LR,
             "local_update": "random mini-batch SGD steps per selected client per round",
             "dp_enabled": False,
         },
@@ -516,11 +528,14 @@ def save_run_config_csv(
         ("paper_migration", "target_dataset", "CIFAR100"),
         ("paper_migration", "model", "ResNet18"),
         ("paper_migration", "partition", "Dirichlet non-IID"),
-        ("paper_migration", "paper_dirichlet_alpha", PAPER_DEFAULT_DIRICHLET_ALPHA),
-        ("paper_migration", "paper_client_fraction", PAPER_DEFAULT_CLIENT_FRACTION),
-        ("paper_migration", "paper_global_rounds", PAPER_DEFAULT_GLOBAL_ROUNDS),
-        ("paper_migration", "paper_batch_size", PAPER_DEFAULT_BATCH_SIZE),
-        ("paper_migration", "local_steps", PAPER_DEFAULT_LOCAL_STEPS),
+        ("paper_migration", "paper_cifar10_dirichlet_alpha", PAPER_SOURCE_DIRICHLET_ALPHA),
+        ("cifar100_main", "dirichlet_alpha", CIFAR100_MAIN_DIRICHLET_ALPHA),
+        ("cifar100_main", "hard_dirichlet_alpha", CIFAR100_HARD_DIRICHLET_ALPHA),
+        ("cifar100_main", "client_fraction", CIFAR100_MAIN_CLIENT_FRACTION),
+        ("cifar100_main", "global_rounds", CIFAR100_MAIN_GLOBAL_ROUNDS),
+        ("cifar100_main", "batch_size", CIFAR100_MAIN_BATCH_SIZE),
+        ("cifar100_main", "local_steps", CIFAR100_MAIN_LOCAL_STEPS),
+        ("cifar100_main", "lr", CIFAR100_MAIN_LR),
         (
             "paper_migration",
             "local_update",

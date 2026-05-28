@@ -32,8 +32,8 @@ PAPER_DEFAULT_NUM_CLIENTS = 20
 PAPER_DEFAULT_CLIENT_FRACTION = 0.8
 PAPER_DEFAULT_DIRICHLET_ALPHA = 0.3
 PAPER_DEFAULT_GLOBAL_ROUNDS = 100
-PAPER_DEFAULT_LOCAL_EPOCHS = 1
-PAPER_DEFAULT_BATCH_SIZE = 16
+PAPER_DEFAULT_LOCAL_STEPS = 3
+PAPER_DEFAULT_BATCH_SIZE = 64
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,13 +85,21 @@ def parse_args() -> argparse.Namespace:
         help="Global communication rounds. Paper default is T=100.",
     )
     parser.add_argument(
+        "--local_steps",
+        type=int,
+        default=PAPER_DEFAULT_LOCAL_STEPS,
+        help=(
+            "Number of random mini-batch SGD steps per selected client per "
+            "communication round. Default is 3 for the CIFAR-100 baseline."
+        ),
+    )
+    parser.add_argument(
         "--local_epochs",
         type=int,
-        default=PAPER_DEFAULT_LOCAL_EPOCHS,
+        default=None,
         help=(
-            "Number of full local epochs when --local_update_mode=full-epoch. "
-            "In random-batch mode, each selected client always updates on one "
-            "random mini-batch per communication round."
+            "Backward-compatible alias for --local_steps in random-batch mode. "
+            "In full-epoch mode, this is the number of full local epochs."
         ),
     )
     parser.add_argument(
@@ -99,8 +107,8 @@ def parse_args() -> argparse.Namespace:
         default="random-batch",
         choices=["random-batch", "full-epoch"],
         help=(
-            "random-batch matches the paper-style local update: one shuffled "
-            "mini-batch per selected client per communication round. "
+            "random-batch performs --local_steps shuffled mini-batch updates "
+            "per selected client per communication round. "
             "full-epoch preserves the old behavior."
         ),
     )
@@ -108,7 +116,7 @@ def parse_args() -> argparse.Namespace:
         "--batch_size",
         type=int,
         default=PAPER_DEFAULT_BATCH_SIZE,
-        help="Local random batch size. Paper default is B=16.",
+        help="Local random batch size. Default is 64 for CIFAR-100 stability.",
     )
     parser.add_argument("--test_batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=0.1)
@@ -132,7 +140,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output_csv",
-        default="results/pf_fedavg_cifar100_resnet18_noniid_alpha0.3.csv",
+        default=(
+            "results/pf_fedavg_cifar100_resnet18_noniid_"
+            "alpha0.3_k20_sr0.8_local3_b64.csv"
+        ),
         help="Where to save per-round train loss and test accuracy.",
     )
     parser.add_argument(
@@ -459,12 +470,15 @@ def save_run_config_json(
             "paper_client_fraction": PAPER_DEFAULT_CLIENT_FRACTION,
             "paper_global_rounds": PAPER_DEFAULT_GLOBAL_ROUNDS,
             "paper_batch_size": PAPER_DEFAULT_BATCH_SIZE,
-            "paper_style_local_update": "one random mini-batch per selected client per round",
+            "local_steps": PAPER_DEFAULT_LOCAL_STEPS,
+            "local_update": "random mini-batch SGD steps per selected client per round",
             "dp_enabled": False,
         },
         "args": vars(args),
         "effective_local_updates_per_round": (
-            1 if args.local_update_mode == "random-batch" else args.local_epochs
+            args.local_steps
+            if args.local_update_mode == "random-batch"
+            else args.local_epochs
         ),
         "client_summary": [
             {
@@ -506,10 +520,11 @@ def save_run_config_csv(
         ("paper_migration", "paper_client_fraction", PAPER_DEFAULT_CLIENT_FRACTION),
         ("paper_migration", "paper_global_rounds", PAPER_DEFAULT_GLOBAL_ROUNDS),
         ("paper_migration", "paper_batch_size", PAPER_DEFAULT_BATCH_SIZE),
+        ("paper_migration", "local_steps", PAPER_DEFAULT_LOCAL_STEPS),
         (
             "paper_migration",
-            "paper_style_local_update",
-            "one random mini-batch per selected client per round",
+            "local_update",
+            "random mini-batch SGD steps per selected client per round",
         ),
         ("paper_migration", "dp_enabled", False),
         ("client_summary", "total_samples", total_samples),
@@ -523,7 +538,7 @@ def save_run_config_csv(
         rows.append(("args", key, value))
 
     effective_local_updates = (
-        1 if args.local_update_mode == "random-batch" else args.local_epochs
+        args.local_steps if args.local_update_mode == "random-batch" else args.local_epochs
     )
     rows.append(("effective", "local_updates_per_round", effective_local_updates))
 
@@ -615,7 +630,8 @@ def train_client(
     model_fn: Callable[[], nn.Module],
     global_state: OrderedDict[str, torch.Tensor],
     train_loader: DataLoader,
-    local_epochs: int,
+    local_steps: int,
+    local_epochs: Optional[int],
     local_update_mode: str,
     lr: float,
     momentum: float,
@@ -637,18 +653,32 @@ def train_client(
     total_loss = 0.0
     total_examples = 0
     if local_update_mode == "random-batch":
-        inputs, targets = next(iter(train_loader))
-        batch_loss, batch_size = train_minibatch(
-            model,
-            criterion,
-            optimizer,
-            inputs,
-            targets,
-            device,
-        )
-        total_loss += batch_loss
-        total_examples += batch_size
+        if local_epochs is not None:
+            local_steps = local_epochs
+        if local_steps <= 0:
+            raise ValueError("--local_steps must be positive.")
+
+        train_iter = iter(train_loader)
+        for _ in range(local_steps):
+            try:
+                inputs, targets = next(train_iter)
+            except StopIteration:
+                train_iter = iter(train_loader)
+                inputs, targets = next(train_iter)
+
+            batch_loss, batch_size = train_minibatch(
+                model,
+                criterion,
+                optimizer,
+                inputs,
+                targets,
+                device,
+            )
+            total_loss += batch_loss
+            total_examples += batch_size
     elif local_update_mode == "full-epoch":
+        if local_epochs is None:
+            local_epochs = local_steps
         if local_epochs <= 0:
             raise ValueError("--local_epochs must be positive.")
         for _ in range(local_epochs):
@@ -766,6 +796,11 @@ def validate_model_output(model_fn: Callable[[], nn.Module]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.local_update_mode == "random-batch" and args.local_epochs is not None:
+        args.local_steps = args.local_epochs
+    if args.local_update_mode == "full-epoch" and args.local_epochs is None:
+        args.local_epochs = args.local_steps
+
     set_random_seed(args.seed)
     device = resolve_device(args.device)
     model_fn = build_model_fn(args.model)
@@ -843,7 +878,10 @@ def main() -> None:
     print(f"Global rounds: {args.global_rounds}")
     print(f"Local update mode: {args.local_update_mode}")
     if args.local_update_mode == "random-batch":
-        print("Local update: one random mini-batch per selected client per round")
+        print(
+            f"Local update: {args.local_steps} random mini-batch SGD steps "
+            "per selected client per round"
+        )
     else:
         print(f"Local update: {args.local_epochs} full local epochs per selected client")
     print(f"Batch size: {args.batch_size}, test_batch_size: {args.test_batch_size}")
@@ -876,6 +914,7 @@ def main() -> None:
                 model_fn=model_fn,
                 global_state=global_state,
                 train_loader=train_loaders[client_id],
+                local_steps=args.local_steps,
                 local_epochs=args.local_epochs,
                 local_update_mode=args.local_update_mode,
                 lr=args.lr,
